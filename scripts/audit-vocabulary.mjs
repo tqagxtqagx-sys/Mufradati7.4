@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 const root = path.resolve(new URL('..', import.meta.url).pathname);
 const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
 const referencesPath = process.argv.find(argument => argument.startsWith('--references='))?.slice('--references='.length);
+const oxfordReferencesPath = process.argv.find(argument => argument.startsWith('--oxford-references='))?.slice('--oxford-references='.length);
 const failures = [];
 const check = (condition, message) => { if (!condition) failures.push(message); };
 
@@ -44,7 +45,7 @@ const validLevels = new Set(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']);
 const validParts = new Set(['noun', 'verb', 'adjective', 'adverb', 'pronoun', 'preposition', 'conjunction', 'determiner', 'exclamation', 'number', 'article', 'auxiliary', 'modal']);
 const required = ['id', 'word', 'level', 'pos', 'ar', 'example', 'exampleAr'];
 
-check(vocabulary.length === 5074, `Expected 5074 vocabulary entries; found ${vocabulary.length}`);
+check(vocabulary.length === 6051, `Expected 6051 vocabulary entries; found ${vocabulary.length}`);
 check(vocabulary.every((entry, index) => entry.id === index + 1), 'Vocabulary IDs or ordering changed');
 
 const missingRequired = vocabulary.filter(entry => required.some(key => entry[key] == null || String(entry[key]).trim() === ''));
@@ -70,7 +71,12 @@ const partial = vocabulary.filter(entry => entry.translationStatus === 'partial'
 const badManualMarkers = vocabulary.filter(entry => (entry.translationStatus === 'partial') !== (entry.manualReviewRequired === true));
 const resolvedReview = vocabulary.filter(entry => entry.translationReview === 'v8.4-425-sense-resolution');
 const priorReview = vocabulary.filter(entry => entry.translationReview === 'v8.3-5074-entry-quality-audit');
+const oxfordImportReview = vocabulary.filter(entry => entry.translationReview === 'v9.0-oxford-pdf-expansion');
 const staleReviewMetadata = vocabulary.filter(entry => {
+  if (entry.translationReview === 'v9.0-oxford-pdf-expansion') {
+    return entry.translationReviewType !== 'pdf-source-and-dictionary-evidence-assisted-curation' ||
+      entry.translationReviewDate !== '2026-07-16';
+  }
   if (entry.translationReview === 'v8.4-425-sense-resolution') {
     return entry.translationReviewType !== 'authoritative-dictionary-assisted-human-curation' ||
       entry.translationReviewDate !== '2026-07-16';
@@ -82,11 +88,92 @@ const staleReviewMetadata = vocabulary.filter(entry => {
 check(badManualMarkers.length === 0, `${badManualMarkers.length} entries have inconsistent manual-review markers`);
 check(staleReviewMetadata.length === 0, `${staleReviewMetadata.length} entries lack current review metadata`);
 check(manual.length === partial.length, 'Manual-review and partial-entry totals differ');
-check(statusCounts.reviewed === 5074, `Expected all 5074 entries to be reviewed; found ${statusCounts.reviewed || 0}`);
+check(statusCounts.reviewed === 6051, `Expected all 6051 entries to be reviewed; found ${statusCounts.reviewed || 0}`);
 check(manual.length === 0, `${manual.length} manual-review entries remain`);
 check(partial.length === 0, `${partial.length} partial entries remain`);
 check(resolvedReview.length === 425, `Expected 425 dictionary-resolved entries; found ${resolvedReview.length}`);
 check(priorReview.length === 4649, `Expected 4649 previously verified entries; found ${priorReview.length}`);
+check(oxfordImportReview.length === 977, `Expected 977 Oxford PDF import entries; found ${oxfordImportReview.length}`);
+
+const oxfordSourceHashes = new Set([
+  'ddaf936ef29f5e67c2df0ab3b547fd5bf9d9631f900c3cf55c195cb9c5ad0b40',
+  '6577e6eb8745226ab7ab80912e83d285cf421ec70e61c92d74d5fef5f2c99570'
+]);
+check([...oxfordSourceHashes].every(hash => /^[a-f0-9]{64}$/.test(hash)), 'An Oxford PDF source hash is not a valid SHA-256 value');
+const irregularExampleForms = new Map([
+  ['give', 'gave'], ['sing', 'sang'], ['overcome', 'overcame'], ['voting', 'votes']
+]);
+const invalidOxfordImports = [];
+let oxfordMeaningCount = 0;
+for (const entry of oxfordImportReview) {
+  const source = entry.selectionSource;
+  const meanings = Array.isArray(entry.meanings) ? entry.meanings : [];
+  oxfordMeaningCount += meanings.length;
+  const coveredParts = new Set(meanings.map(meaning => meaning.pos));
+  const sourceIsValid = source &&
+    entry.sourceSelectionAuthority === source.name &&
+    oxfordSourceHashes.has(source.fileSha256) &&
+    Number.isInteger(source.page) && Number.isInteger(source.column) && Number.isInteger(source.line) &&
+    String(source.sourceKey || '').trim() !== '' &&
+    (source.name === 'The Oxford 3000' || (source.name === 'The Oxford 5000 by CEFR level' && entry.level === 'B2'));
+  const base = String(entry.word).toLowerCase().replace(/[^a-z]/g, '');
+  const stem = base.slice(0, Math.max(3, Math.min(6, base.length - 2)));
+  const compactExample = String(entry.example).toLowerCase().replace(/[^a-z]/g, '');
+  const irregular = irregularExampleForms.get(String(entry.word));
+  const exampleUsesHeadword = compactExample.includes(stem) || (irregular && compactExample.includes(irregular));
+  const meaningsAreValid = meanings.length > 0 && entry.partsOfSpeech.every(part => coveredParts.has(part)) && meanings.every(meaning =>
+    entry.partsOfSpeech.includes(meaning.pos) &&
+    String(meaning.ar || '').trim() !== '' && !/[A-Za-z]/.test(meaning.ar) && !/\s\/\s/.test(meaning.ar) &&
+    String(meaning.definition || '').trim() !== '' && String(meaning.example || '').trim() !== '' &&
+    String(meaning.exampleAr || '').trim() !== '' && /[\u0600-\u06ff]/.test(meaning.exampleAr) &&
+    /^[a-f0-9]{64}$/.test(String(meaning.sourceDefinitionSha256 || '')) &&
+    /^[a-f0-9]{64}$/.test(String(meaning.definitionSha256 || '')) &&
+    /^https:\/\//.test(String(meaning.sourceUrl || '')) &&
+    String(meaning.definitionCreationMethod || '').trim() !== '' &&
+    String(meaning.exampleCreationMethod || '').trim() !== ''
+  );
+  if (!sourceIsValid || !['A1', 'A2', 'B1', 'B2'].includes(entry.level) ||
+      entry.manualReviewRequired !== false || !String(entry.definition || '').trim() ||
+      !meaningsAreValid || !exampleUsesHeadword) {
+    invalidOxfordImports.push(`${entry.id}:${entry.sourceWord}`);
+  }
+}
+check(oxfordMeaningCount === 1050, `Expected 1050 Oxford import meanings; found ${oxfordMeaningCount}`);
+check(invalidOxfordImports.length === 0, `${invalidOxfordImports.length} Oxford import entries have invalid source, content, or examples`);
+
+let oxfordSourceEvidenceHashMismatches = null;
+if (oxfordReferencesPath) {
+  const referenceFile = JSON.parse(fs.readFileSync(oxfordReferencesPath, 'utf8'));
+  const references = new Map(referenceFile.references.map(reference => [reference.sourceKey, reference]));
+  oxfordSourceEvidenceHashMismatches = [];
+  for (const entry of oxfordImportReview) {
+    const reference = references.get(entry.selectionSource.sourceKey);
+    const senses = reference ? [
+      ...(reference.reference?.bilingual?.senses || []),
+      ...(reference.reference?.english?.senses || [])
+    ] : [];
+    const sourceHashes = new Set(senses.map(sense => sense.definitionSha256).filter(Boolean));
+    if (!reference || reference.reference?.english?.httpStatus !== 200 || sourceHashes.size === 0) {
+      oxfordSourceEvidenceHashMismatches.push(`${entry.id}:missing-reference`);
+      continue;
+    }
+    for (const meaning of entry.meanings) {
+      if (!sourceHashes.has(meaning.sourceDefinitionSha256)) {
+        oxfordSourceEvidenceHashMismatches.push(`${entry.id}:${meaning.pos}:${meaning.ar}`);
+      }
+    }
+  }
+  check(oxfordSourceEvidenceHashMismatches.length === 0, `${oxfordSourceEvidenceHashMismatches.length} Oxford meaning hashes do not match the fetched dictionary evidence`);
+}
+
+const cefrCorrections = vocabulary.filter(entry => entry.cefrReview === 'v9.0-oxford-pdf-level-correction');
+const invalidCefrCorrections = cefrCorrections.filter(entry =>
+  !entry.previousCefrLevel || !entry.cefrCorrectionSource ||
+  !oxfordSourceHashes.has(entry.cefrCorrectionSource.fileSha256) ||
+  !entry.levels.includes(entry.level) || entry.cefrReviewDate !== '2026-07-16'
+);
+check(cefrCorrections.length === 31, `Expected 31 PDF-backed CEFR corrections; found ${cefrCorrections.length}`);
+check(invalidCefrCorrections.length === 0, `${invalidCefrCorrections.length} CEFR corrections have invalid provenance`);
 
 const invalidResolvedMeanings = [];
 const missingMeaningPosCoverage = [];
@@ -255,6 +342,11 @@ const report = {
     manualReviewRequired: manual.length,
     partialRecords: partial.length,
     resolvedReviewEntries: resolvedReview.length,
+    oxfordImportEntries: oxfordImportReview.length,
+    oxfordImportMeanings: oxfordMeaningCount,
+    cefrCorrections: cefrCorrections.length,
+    invalidOxfordImports: invalidOxfordImports.length,
+    oxfordSourceEvidenceHashMismatches,
     resolvedMeaningCount,
     dictionaryLinkedMeaningCount,
     curatedFallbackMeaningCount,
