@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 
 const root = path.resolve(new URL('..', import.meta.url).pathname);
 const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+const referencesPath = process.argv.find(argument => argument.startsWith('--references='))?.slice('--references='.length);
 const failures = [];
 const check = (condition, message) => { if (!condition) failures.push(message); };
 
@@ -67,14 +68,87 @@ for (const entry of vocabulary) {
 const manual = vocabulary.filter(entry => entry.manualReviewRequired === true);
 const partial = vocabulary.filter(entry => entry.translationStatus === 'partial');
 const badManualMarkers = vocabulary.filter(entry => (entry.translationStatus === 'partial') !== (entry.manualReviewRequired === true));
-const staleReviewMetadata = vocabulary.filter(entry =>
-  entry.translationReview !== 'v8.3-5074-entry-quality-audit' ||
-  entry.translationReviewType !== 'ai-assisted-entry-by-entry-quality-audit' ||
-  entry.translationReviewDate !== '2026-07-15'
-);
+const resolvedReview = vocabulary.filter(entry => entry.translationReview === 'v8.4-425-sense-resolution');
+const priorReview = vocabulary.filter(entry => entry.translationReview === 'v8.3-5074-entry-quality-audit');
+const staleReviewMetadata = vocabulary.filter(entry => {
+  if (entry.translationReview === 'v8.4-425-sense-resolution') {
+    return entry.translationReviewType !== 'authoritative-dictionary-assisted-human-curation' ||
+      entry.translationReviewDate !== '2026-07-16';
+  }
+  return entry.translationReview !== 'v8.3-5074-entry-quality-audit' ||
+    entry.translationReviewType !== 'ai-assisted-entry-by-entry-quality-audit' ||
+    entry.translationReviewDate !== '2026-07-15';
+});
 check(badManualMarkers.length === 0, `${badManualMarkers.length} entries have inconsistent manual-review markers`);
 check(staleReviewMetadata.length === 0, `${staleReviewMetadata.length} entries lack current review metadata`);
 check(manual.length === partial.length, 'Manual-review and partial-entry totals differ');
+check(statusCounts.reviewed === 5074, `Expected all 5074 entries to be reviewed; found ${statusCounts.reviewed || 0}`);
+check(manual.length === 0, `${manual.length} manual-review entries remain`);
+check(partial.length === 0, `${partial.length} partial entries remain`);
+check(resolvedReview.length === 425, `Expected 425 dictionary-resolved entries; found ${resolvedReview.length}`);
+check(priorReview.length === 4649, `Expected 4649 previously verified entries; found ${priorReview.length}`);
+
+const invalidResolvedMeanings = [];
+const missingMeaningPosCoverage = [];
+let resolvedMeaningCount = 0;
+let dictionaryLinkedMeaningCount = 0;
+let curatedFallbackMeaningCount = 0;
+for (const entry of resolvedReview) {
+  const meanings = Array.isArray(entry.meanings) ? entry.meanings : [];
+  resolvedMeaningCount += meanings.length;
+  const coveredParts = new Set(meanings.map(meaning => meaning.pos));
+  for (const pos of entry.partsOfSpeech) {
+    if (!coveredParts.has(pos)) missingMeaningPosCoverage.push(`${entry.id}:${pos}`);
+  }
+  const meaningKeys = new Set();
+  for (const meaning of meanings) {
+    const key = `${meaning.pos}|${String(meaning.ar).trim().toLowerCase()}`;
+    const valid = entry.partsOfSpeech.includes(meaning.pos) &&
+      String(meaning.ar || '').trim() !== '' && meaning.senseAr === meaning.ar &&
+      !/[A-Za-z]/.test(meaning.ar) && !/\s\/\s/.test(meaning.ar) &&
+      /^https:\/\//.test(String(meaning.sourceUrl || '')) &&
+      /^[a-f0-9]{64}$/.test(String(meaning.sourceDefinitionSha256 || '')) &&
+      !meaningKeys.has(key);
+    if (!valid) invalidResolvedMeanings.push(`${entry.id}:${key}`);
+    meaningKeys.add(key);
+    if (meaning.posSourceUrl) curatedFallbackMeaningCount += 1;
+    else dictionaryLinkedMeaningCount += 1;
+  }
+  const sourceNames = new Set((entry.dictionarySources || []).map(source => source.name));
+  if (!String(entry.sourceSummaryAr || '').trim() ||
+      !sourceNames.has('Cambridge English–Arabic Dictionary') ||
+      !sourceNames.has('Cambridge English Dictionary') ||
+      !sourceNames.has('Oxford 3000 by CEFR level')) {
+    invalidResolvedMeanings.push(`${entry.id}:record-sources`);
+  }
+}
+check(missingMeaningPosCoverage.length === 0, `${missingMeaningPosCoverage.length} part-of-speech meanings are missing`);
+check(invalidResolvedMeanings.length === 0, `${invalidResolvedMeanings.length} resolved meanings have invalid content or source evidence`);
+
+let sourceEvidenceHashMismatches = null;
+if (referencesPath) {
+  const referenceFile = JSON.parse(fs.readFileSync(referencesPath, 'utf8'));
+  const references = new Map(referenceFile.references.map(reference => [reference.id, reference]));
+  sourceEvidenceHashMismatches = [];
+  for (const entry of resolvedReview) {
+    const reference = references.get(entry.id);
+    if (!reference || reference.error || !reference.english?.senses?.length) {
+      sourceEvidenceHashMismatches.push(`${entry.id}:missing-reference`);
+      continue;
+    }
+    const sourceHashes = new Set(
+      [...(reference.bilingual?.senses || []), ...(reference.english?.senses || [])]
+        .filter(sense => String(sense.definition || '').trim())
+        .map(sense => crypto.createHash('sha256').update(sense.definition.trim()).digest('hex'))
+    );
+    for (const meaning of entry.meanings) {
+      if (!sourceHashes.has(meaning.sourceDefinitionSha256)) {
+        sourceEvidenceHashMismatches.push(`${entry.id}:${meaning.pos}:${meaning.ar}`);
+      }
+    }
+  }
+  check(sourceEvidenceHashMismatches.length === 0, `${sourceEvidenceHashMismatches.length} meaning hashes do not match the fetched dictionary evidence`);
+}
 
 const manualDictionaryFlags = vocabulary.filter(entry => entry.qualityIssues?.includes('manual-dictionary-check-recommended'));
 const generatedMissingHeadword = vocabulary.filter(entry => {
@@ -147,6 +221,31 @@ if (process.argv.includes('--write-manual-list')) {
   );
 }
 
+if (process.argv.includes('--write-source-list')) {
+  const csvCell = value => `"${String(value ?? '').replaceAll('"', '""')}"`;
+  const csvRows = [
+    ['id', 'word', 'cefr', 'parts_of_speech', 'resolved_meanings', 'cambridge_english_arabic_url', 'cambridge_english_url', 'oxford_pos_url', 'review_status'],
+    ...resolvedReview.map(entry => {
+      const sourceUrl = name => entry.dictionarySources.find(source => source.name === name)?.url || '';
+      return [
+        entry.id,
+        entry.word,
+        entry.level,
+        entry.partsOfSpeech.join(' + '),
+        entry.meanings.length,
+        sourceUrl('Cambridge English–Arabic Dictionary'),
+        sourceUrl('Cambridge English Dictionary'),
+        sourceUrl('Oxford 3000 by CEFR level'),
+        'verified'
+      ];
+    })
+  ];
+  fs.writeFileSync(
+    path.join(root, 'VOCABULARY-DICTIONARY-AUDIT.csv'),
+    `${csvRows.map(row => row.map(csvCell).join(',')).join('\n')}\n`
+  );
+}
+
 const report = {
   pass: failures.length === 0,
   failures,
@@ -154,6 +253,14 @@ const report = {
     total: vocabulary.length,
     statusCounts,
     manualReviewRequired: manual.length,
+    partialRecords: partial.length,
+    resolvedReviewEntries: resolvedReview.length,
+    resolvedMeaningCount,
+    dictionaryLinkedMeaningCount,
+    curatedFallbackMeaningCount,
+    missingMeaningPosCoverage: missingMeaningPosCoverage.length,
+    invalidResolvedMeanings: invalidResolvedMeanings.length,
+    sourceEvidenceHashMismatches,
     exampleQualityCounts: exampleCounts,
     levelCounts,
     missingRequired: missingRequired.length,
